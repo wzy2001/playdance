@@ -1,0 +1,52 @@
+<resources>
+    <string name="app_name">舞蹈练习</string>
+
+    <!-- 主页 -->
+    <string name="home_title">视频库</string>
+    <string name="home_empty">还没有视频，点右下角 + 添加</string>
+    <string name="add_video">添加视频</string>
+    <string name="add_local_video">添加本地视频</string>
+    <string name="add_from_url">输入 URL</string>
+    <string name="add_from_url_hint">输入视频直链，获取信息后下载到本地</string>
+    <string name="has_dubbing">有配音</string>
+    <string name="delete_video">删除</string>
+
+    <!-- 播放器 -->
+    <string name="player_play">播放</string>
+    <string name="player_pause">暂停</string>
+    <string name="player_loop">循环</string>
+    <string name="player_video_missing">视频文件不存在或已被删除</string>
+    <string name="back">返回</string>
+
+    <!-- 分段（里程碑 3） -->
+    <string name="player_segment_edit">分段</string>
+    <string name="player_split_insert">分割</string>
+    <string name="player_split_delete">删除</string>
+
+    <!-- 手势（里程碑 4） -->
+    <string name="player_gesture_slow">0.5× 慢速</string>
+    <string name="player_gesture_reverse">2× 倒放</string>
+    <string name="player_gesture_seek">%1$+d 秒</string>
+
+    <!-- 录音（里程碑 5） -->
+    <string name="player_record">录音</string>
+    <string name="player_record_stop">停止录音</string>
+    <string name="player_record_permission_denied">需要麦克风权限才能录音</string>
+
+    <!-- 配音回放（里程碑 6） -->
+    <string name="player_volume_original">原声</string>
+    <string name="player_dubbing">配音</string>
+
+    <!-- 网络视频（里程碑 7） -->
+    <string name="url_dialog_title">添加网络视频</string>
+    <string name="url_input_label">视频链接</string>
+    <string name="url_fetch_info">获取信息</string>
+    <string name="url_fetching">正在获取视频信息…</string>
+    <string name="url_download_local">下载到本地</string>
+    <string name="url_downloading">正在下载…</string>
+    <string name="url_download_progress">正在下载… %1$d%%</string>
+    <string name="url_fetch_failed">获取视频信息失败，请检查链接是否为可直接访问的视频地址</string>
+    <string name="url_download_failed">下载失败，请重试</string>
+    <string name="url_retry">重试</string>
+    <string name="cancel">取消</string>
+</resources>
