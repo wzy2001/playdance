@@ -13,3 +13,14 @@
 .externalNativeBuild
 .cxx
 local.properties
+
+# Release signing (never commit)
+keystore.properties
+*.jks
+*.keystore
+
+# Built share packages
+/*.apk
+
+# Kotlin build session cache
+.kotlin

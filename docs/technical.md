@@ -76,9 +76,15 @@ RecordingChunk(id, videoId FK, audioPath, blockStartMs, blockEndMs, recordedMs, 
 - **播放界面视觉重做**（2026-09-08，参考 B 站播放器风格，纯视觉、不改功能）：顶/底栏改渐变遮罩(`Brush.verticalGradient`)；时间轴进度条改自绘 `Canvas`（`TimelineSlider`：细圆角轨 3dp + 粉色已播放段 `TimelineAccent #FB7299` + 圆形滑块 + 分段刻度），**不用** Material `Slider` 的自定义 track/thumb（M3 1.4.0 该重载为实验 API，本工程 `@OptIn` 在 AGP 9 内置 Kotlin 下未生效）；时间显示移至进度条上方左对齐，录制计时留在按钮行；音量/配音区改半透明圆角面板。色调常量集中在 `PlayerScreen.kt` 顶部（`TimelineAccent`/`ScrimTop`/`ScrimBottom`/`ControlIdle`），不影响全局主题。**系统栏内缩**：遮罩必须 edge-to-edge（不能在控件层根 `Box` 上加 `systemBarsPadding()`，否则底部露黑带）；顶栏用 `windowInsetsPadding(WindowInsets.statusBars)`；底栏**不能**直接套 `navigationBars` 内边距——那会把控件顶到 16:9 视频的黑边之上、控件下露出黑带，令控件「浮」在屏幕中部；改为 `WindowInsets.navigationBars.getBottom()` 取实际值、**封顶 16dp** 后再作为底部 padding，使控件贴近屏幕下沿（参考图样式）同时不被手势条压住。
 - **音量与「节拍」控件**（2026-09-08 用户要求）：视频声跟随**系统媒体音量**——主 `player.volume = 1f`，删除了 App 内的「原声」滑条（`originalVolume`/`setOriginalVolume` 一并移除）。原「配音」回放在界面改称**「节拍」**（内部字段仍名 `dubbing*`，功能不变）：主页标记文案「有节拍」；播放页控件为底栏按钮行的「节拍」按钮（分段、倍速之间），点开是含开关 + 音量滑条的面板。`dubbingVolume` 语义改为**相对视频音量的倍率**，范围 `0..2`（默认 1，>1 可放大偏小的节拍声），常量 `PlayerViewModel.MAX_DUBBING_VOLUME`、`PlayerScreen.MAX_BEAT_VOLUME`。
 - **统一蓝色系**（2026-09-08 用户要求）：`Color.kt`/`Theme.kt` 全局改为蓝系（`Blue80/Blue40` + `BlueGrey` + `Sky`），**关闭动态取色**（`dynamicColor` 会用壁纸色覆盖，已移除该参数）；播放页覆盖层的强调色统一为 `AccentBlue (#4A90E2)`（时间轴已播放段、循环/节拍/分段编辑激活态），原粉 `#FB7299` 不再使用。**例外**：录音指示保留红色 `#FF5252`（`PlayerScreen.RecordingAccent`，用户要求与蓝色激活态区分）；`colorScheme.error`（删除类语义色）与白/黑/遮罩色保留。
-- **应用图标与开屏**（2026-09-08 用户要求，素材 `icon.jpg` / `figure.jpg` 在工程根目录）：
-  - 图标：自适应图标（`mipmap-anydpi/ic_launcher.xml`），前景 `ic_launcher_foreground.png`（各密度，白色舞蹈小人抠图、缩放居中于安全区），背景色 `values/colors.xml` 的 `ic_launcher_background (#A4D1F0)`；另有各密度位图 `ic_launcher(_round).png` 兼容旧启动器。旧的模板矢量图标（`ic_launcher_background/foreground.xml`）与 webp 已删。
+- **应用图标与开屏**（2026-09-08 用户要求，素材 `icon.jpg` / `figure.jpg` 在工程根目录）：  - 图标：自适应图标（`mipmap-anydpi/ic_launcher.xml`），前景 `ic_launcher_foreground.png`（各密度，白色舞蹈小人抠图、缩放居中于安全区），背景色 `values/colors.xml` 的 `ic_launcher_background (#A4D1F0)`；另有各密度位图 `ic_launcher(_round).png` 兼容旧启动器。旧的模板矢量图标（`ic_launcher_background/foreground.xml`）与 webp 已删。
   - 开屏：**不引第三方库**（未缓存 `androidx.core:core-splashscreen`，避免拉依赖风险），纯主题实现——`drawable/splash_background.xml`（米黄 `#FDF5D8` + 居中 `splash_logo`）设为 `android:windowBackground`；`values-v31/themes.xml` 复用 `windowSplashScreenBackground`/`windowSplashScreenAnimatedIcon`（Android 12+ 系统 SplashScreen）。logo 为 `figure.jpg` 裁出的猫，各密度 `drawable-*/splash_logo.png`。
+
+## 打包与签名（2026-09-08）
+
+- 分发包用 **release** 构建：`./gradlew assembleRelease`，产物在 `app/build/outputs/apk/release/app-release.apk`。
+- 签名材料：keystore `dance-release.jks`（工程根，别名 `dance`）+ 凭据 `keystore.properties`（根）。**两者都不进版本库**（已在 `.gitignore`）。`app/build.gradle.kts` 顶部读取该属性文件，文件缺失时 release 不签名但仍可构建（CI 友好）。
+- `release` 的 R8 保持**关闭**（`optimization.enable = false`）：保证与 debug 行为一致，避免混淆引发 Compose/Media3/Room 运行期问题；代价是包体较大（约 21 MB）。
+- **更新须知**：同包名的新版本必须用**同一 keystore** 签名，否则已安装用户无法覆盖安装（只能卸载重装）。务必备份 `dance-release.jks` 与 `keystore.properties`；丢失后无法再发覆盖更新。
 
 ## 权限
 
