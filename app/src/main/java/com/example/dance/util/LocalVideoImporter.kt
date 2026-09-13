@@ -18,7 +18,8 @@ import kotlinx.coroutines.withContext
  */
 class LocalVideoImporter(
     private val context: Context,
-    private val repository: VideoRepository
+    private val repository: VideoRepository,
+    private val thumbnails: ThumbnailGenerator
 ) {
 
     /**
@@ -29,7 +30,9 @@ class LocalVideoImporter(
         runCatching {
             val name = queryDisplayName(uri) ?: "video_${System.currentTimeMillis()}"
             val videoDir = File(context.filesDir, "videos").apply { mkdirs() }
-            val target = File(videoDir, "$name")
+            // Timestamp prefix keeps a re-import of a same-named file from
+            // overwriting the earlier video's source file.
+            val target = File(videoDir, "${System.currentTimeMillis()}_$name")
 
             context.contentResolver.openInputStream(uri)?.use { input ->
                 target.outputStream().use { input.copyTo(it) }
@@ -40,7 +43,7 @@ class LocalVideoImporter(
                 title = name.substringBeforeLast('.'),
                 filePath = target.absolutePath,
                 durationMs = durationMs,
-                thumbnailPath = null,
+                thumbnailPath = thumbnails.generate(target.absolutePath),
                 sourceType = VideoSourceType.LOCAL
             )
             repository.addVideo(video)

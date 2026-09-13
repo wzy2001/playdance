@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <!--
+      Android 12+ splash screen: the platform draws it from the theme, so the
+      background/icon colors are pinned to our palette (cream + cat artwork)
+      instead of the default app-icon splash.
+    -->
+    <style name="Theme.Dance" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@drawable/splash_background</item>
+        <item name="android:windowSplashScreenBackground">@color/splash_background</item>
+        <item name="android:windowSplashScreenAnimatedIcon">@drawable/splash_logo</item>
+    </style>
+
+</resources>

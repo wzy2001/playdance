@@ -6,6 +6,7 @@
 
 | 用途 | 路径 |
 |------|------|
+| 会话交接说明（新会话先读） | [HANDOFF.md](HANDOFF.md) |
 | 方案设计文档（**权威**，功能与技术已定稿） | [DESIGN.md](DESIGN.md) |
 | 开发需求（分层索引 + 补充说明） | [docs/requirements.md](docs/requirements.md) |
 | 技术方案（选型/约束/依赖，含待验证项） | [docs/technical.md](docs/technical.md) |
@@ -35,4 +36,4 @@
 
 - 项目：跳舞练习视频播放器（见 [DESIGN.md](DESIGN.md)）。
 - 环境：Gradle 9.5 / AGP 9.3.2 / Kotlin 2.2.10 / compileSdk 37 / minSdk 26。
-- 进度：**里程碑 1–6 已验收通过；里程碑 7（网络视频）代码完成、构建通过，待用户人工验收**。下一步：里程碑 8（打磨）。
+- 进度：**里程碑 1–7 已验收通过**（里程碑 7 形态：B 站缓存 m4s 导入，URL 直链下载已按用户要求移除）。下一步：里程碑 8（打磨）。

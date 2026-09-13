@@ -27,6 +27,17 @@ interface VideoDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insert(video: Video): Long
 
+    /**
+     * Updates an existing row in place. Never use REPLACE-insert for updates:
+     * with foreign keys on, REPLACE deletes the old row first, cascading away
+     * the video's segments and recording chunks.
+     */
+    @Update
+    suspend fun update(video: Video)
+
+    @Query("SELECT * FROM videos WHERE thumbnailPath IS NULL")
+    suspend fun getMissingThumbnails(): List<Video>
+
     @Query("SELECT * FROM videos ORDER BY createdAt DESC")
     fun observeAll(): Flow<List<Video>>
 
@@ -107,6 +118,10 @@ interface RecordingChunkDao {
 
     @Delete
     suspend fun deleteAll(chunks: List<RecordingChunk>)
+
+    /** Every audio path referenced by any chunk; used to sweep orphan files. */
+    @Query("SELECT audioPath FROM recording_chunks")
+    suspend fun getAllAudioPaths(): List<String>
 
     /**
      * Inserts [chunk], removing any chunk whose block overlaps it (re-recording a

@@ -4,8 +4,6 @@
 
     <!-- Dubbing recording (DESIGN 2.5): microphone only, requested at runtime. -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
-    <!-- Network video metadata fetch and download (DESIGN 2.1). -->
-    <uses-permission android:name="android.permission.INTERNET" />
 
     <application
         android:name=".DanceApplication"
@@ -16,7 +14,6 @@
         android:label="@string/app_name"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
-        android:usesCleartextTraffic="true"
         android:theme="@style/Theme.Dance">
         <activity
             android:name=".MainActivity"

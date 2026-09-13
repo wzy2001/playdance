@@ -25,6 +25,10 @@ class VideoRepository(private val db: com.example.dance.data.db.AppDatabase) {
 
     suspend fun addVideo(video: Video): Long = videoDao.insert(video)
 
+    suspend fun updateVideo(video: Video) = videoDao.update(video)
+
+    suspend fun getVideosWithoutThumbnail(): List<Video> = videoDao.getMissingThumbnails()
+
     suspend fun deleteVideo(video: Video) = videoDao.delete(video)
 
     suspend fun countVideos(): Int = videoDao.count()
@@ -52,6 +56,9 @@ class VideoRepository(private val db: com.example.dance.data.db.AppDatabase) {
     suspend fun getChunks(videoId: Long): List<RecordingChunk> = chunkDao.getForVideo(videoId)
 
     suspend fun addChunk(chunk: RecordingChunk): Long = chunkDao.insert(chunk)
+
+    /** Every audio path referenced by any chunk; used to sweep orphan files. */
+    suspend fun getAllChunkAudioPaths(): List<String> = chunkDao.getAllAudioPaths()
 
     /**
      * Saves a freshly recorded chunk, replacing any chunk whose block overlaps

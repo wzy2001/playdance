@@ -5,6 +5,7 @@ import android.media.MediaRecorder
 import android.net.Uri
 import android.os.Build
 import android.os.SystemClock
+import android.content.res.Configuration
 import android.util.Log
 import androidx.annotation.OptIn
 import androidx.lifecycle.ViewModel
@@ -52,6 +53,8 @@ data class PlayerUiState(
     val loopEnabled: Boolean = true,
     /** True when the source video is wider than tall (after applying rotation metadata). */
     val isLandscapeVideo: Boolean = false,
+    /** True once the player has reported the real orientation; gates the initial play. */
+    val orientationKnown: Boolean = false,
     val videoMissing: Boolean = false,
     /** Interior split points (ms), sorted ascending; boundaries 0 and duration are implicit. */
     val splitPoints: List<Long> = emptyList(),
@@ -66,11 +69,12 @@ data class PlayerUiState(
     val isRecording: Boolean = false,
     /** Elapsed recording time for the timer display; 0 when not recording. */
     val recordingElapsedMs: Long = 0L,
-    /** Dubbing playback switch (DESIGN 2.6): off = original sound only. */
+    /** Beat (dubbing) playback switch: off = original sound only. */
     val dubbingEnabled: Boolean = true,
-    /** Master player volume (original sound slider), 0..1. */
-    val originalVolume: Float = 1f,
-    /** Dubbing player volume (dubbing slider), 0..1. */
+    /**
+     * Beat (dubbing) volume multiplier relative to the video sound, 0..2.
+     * 1 = same level as the video, >1 boosts a quiet beat (2026-09-08).
+     */
     val dubbingVolume: Float = 1f
 ) {
     /** Segment boundaries including both ends: [0, split..., duration]. */
@@ -110,6 +114,9 @@ class PlayerViewModel(
     // still be null at that point.
     private var latestChunks: List<RecordingChunk> = emptyList()
 
+    /** Set once the gated initial play has fired; the screen won't auto-play again. */
+    private var initialPlayStarted = false
+
     /**
      * Absolute video-time start (ms) of each item in the dubbing playlist.
      * Empty when the video has no playable dubbing chunks.
@@ -120,6 +127,9 @@ class PlayerViewModel(
 
     init {
         player.repeatMode = Player.REPEAT_MODE_ONE
+        // Video sound follows the system media volume: no per-app scaling on
+        // the master player (2026-09-08). Only the beat player is scaled.
+        player.volume = 1f
         // Surface dubbing playback failures in logcat; the dubbing player is
         // otherwise silent about errors (no UI of its own).
         dubbingPlayer.addListener(object : Player.Listener {
@@ -168,7 +178,12 @@ class PlayerViewModel(
                     videoSize.unappliedRotationDegrees == 270
                 val width = if (rotated) videoSize.height else videoSize.width
                 val height = if (rotated) videoSize.width else videoSize.height
-                _uiState.update { it.copy(isLandscapeVideo = width > height) }
+                _uiState.update {
+                    it.copy(
+                        isLandscapeVideo = width > height,
+                        orientationKnown = true
+                    )
+                }
             }
         })
 
@@ -185,12 +200,27 @@ class PlayerViewModel(
             } else {
                 emptyList()
             }
+            // Resolve the orientation from the file BEFORE prepare(): the real
+            // dimensions only arrive via onVideoSizeChanged, which is late enough
+            // for a landscape video to have flashed portrait frames. Reading them
+            // off the main thread keeps the lock decision ready on the first frame.
+            val landscape = withContext(Dispatchers.IO) { isLandscapeFile(video.filePath) }
             _uiState.update {
-                it.copy(title = video.title, durationMs = video.durationMs, splitPoints = splits)
+                it.copy(
+                    title = video.title,
+                    durationMs = video.durationMs,
+                    splitPoints = splits,
+                    isLandscapeVideo = landscape,
+                    orientationKnown = true
+                )
             }
             player.setMediaItem(MediaItem.fromUri(Uri.fromFile(File(video.filePath))))
             player.prepare()
-            player.play()
+            // Deliberately no play() here: the screen waits for the real
+            // orientation (onVideoSizeChanged → orientationKnown) and for the
+            // activity to actually be in that orientation before playing, so a
+            // landscape video doesn't flash a few portrait frames first. The
+            // initial play is fired from the screen via [startPlaybackWhenOriented].
         }
 
         // Rebuild the dubbing timeline whenever the chunk set changes (initial
@@ -524,6 +554,40 @@ class PlayerViewModel(
         }
     }
 
+    /**
+     * App went to background (Activity ON_STOP, not a config change): save any
+     * in-progress recording — same semantics as a manual stop — and pause
+     * playback. The dubbing player follows via the ticker. Nothing resumes
+     * automatically on return; the paused player keeps its position.
+     */
+    fun onHostStopped() {
+        if (_uiState.value.isRecording) stopRecording()
+        player.pause()
+        // Consume the one-shot initial play: leaving the screen (or going to
+        // background, possibly mid-rotation) means we must not auto-play on a
+        // later recomposition — the user resumes manually (per the confirmed
+        // foreground semantics).
+        initialPlayStarted = true
+    }
+
+    /**
+     * One-shot initial play, fired by the screen whenever the composition's
+     * orientation may have settled. A landscape source waits for the activity to
+     * actually be landscape (it rotates first, so no portrait frames are shown);
+     * a portrait source plays as soon as its orientation is known, regardless of
+     * the current device orientation (FIT scaling letterboxes a sideways
+     * portrait). The guard means a user who paused during the brief preparation
+     * window stays paused — this is the only auto-play pass.
+     */
+    fun startPlaybackWhenOriented(currentOrientation: Int) {
+        if (initialPlayStarted) return
+        val s = _uiState.value
+        if (!s.orientationKnown || s.videoMissing) return
+        if (s.isLandscapeVideo && currentOrientation != Configuration.ORIENTATION_LANDSCAPE) return
+        initialPlayStarted = true
+        player.play()
+    }
+
     /** Reads the true duration of the recorded m4a; falls back to wall-clock time. */
     private fun readAudioDurationMs(file: File, fallback: Long): Long {
         val retriever = MediaMetadataRetriever()
@@ -538,10 +602,40 @@ class PlayerViewModel(
         }
     }
 
+    /**
+     * True when the source file displays wider than tall. Mirrors the
+     * onVideoSizeChanged normalization (rotation swaps the reported dimensions)
+     * but is resolvable before prepare(), so the lock decision precedes the
+     * first frame. False on any failure — the late onVideoSizeChanged callback
+     * then corrects it.
+     */
+    private fun isLandscapeFile(path: String): Boolean {
+        val retriever = MediaMetadataRetriever()
+        return try {
+            retriever.setDataSource(path)
+            val width = retriever
+                .extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull()
+            val height = retriever
+                .extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull()
+            val rotation = retriever
+                .extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)
+                ?.toIntOrNull() ?: 0
+            if (width == null || height == null) return false
+            val rotated = rotation == 90 || rotation == 270
+            val displayWidth = if (rotated) height else width
+            val displayHeight = if (rotated) width else height
+            displayWidth > displayHeight
+        } catch (e: Exception) {
+            false
+        } finally {
+            retriever.release()
+        }
+    }
+
     // --- Dubbing playback (DESIGN 2.6 / 5.2) ---
     // (Timeline state fields are declared above init; see the note there.)
 
-    /** Dubbing on/off (DESIGN 2.6): off = original sound only. */
+    /** Beat (dubbing) on/off: off = original sound only. */
     fun toggleDubbing() {
         val s = _uiState.value
         if (s.isRecording) return
@@ -551,14 +645,13 @@ class PlayerViewModel(
         _uiState.update { it.copy(dubbingEnabled = enabled) }
     }
 
-    fun setOriginalVolume(volume: Float) {
-        val v = volume.coerceIn(0f, 1f)
-        player.volume = v
-        _uiState.update { it.copy(originalVolume = v) }
-    }
-
+    /**
+     * Beat volume as a multiplier of the video sound (0..2). The master player
+     * keeps volume 1f so the video follows the system media volume; only the
+     * beat player is scaled (so a quiet beat can be boosted above the video).
+     */
     fun setDubbingVolume(volume: Float) {
-        val v = volume.coerceIn(0f, 1f)
+        val v = volume.coerceIn(0f, MAX_DUBBING_VOLUME)
         if (_uiState.value.dubbingEnabled) dubbingPlayer.volume = v
         _uiState.update { it.copy(dubbingVolume = v) }
     }
@@ -707,8 +800,9 @@ class PlayerViewModel(
     }
 
     override fun onCleared() {
-        // If the screen is destroyed mid-recording, discard the partial take
-        // (proper interruption recovery is Milestone 8 scope).
+        // Leaving the screen (back navigation) mid-recording discards the
+        // partial take by design; a background interruption is saved earlier
+        // via [onHostStopped], so a live recorder here means a deliberate exit.
         recorder?.let {
             try {
                 it.stop()
@@ -746,6 +840,9 @@ class PlayerViewModel(
         /** Dubbing sync: max tolerated drift, and min gap between corrective seeks. */
         private const val DUB_SYNC_TOLERANCE_MS = 300L
         private const val DUB_CORRECTION_MIN_INTERVAL_MS = 500L
+
+        /** Beat volume multiplier cap; >1 lets a quiet beat be boosted (2026-09-08). */
+        private const val MAX_DUBBING_VOLUME = 2f
 
         fun factory(videoId: Long): ViewModelProvider.Factory = viewModelFactory {
             initializer {

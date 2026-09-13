@@ -59,16 +59,32 @@ RecordingChunk(id, videoId FK, audioPath, blockStartMs, blockEndMs, recordedMs, 
 
 ## 网络视频（里程碑 7 实现决策）
 
-- **元信息探测**：`MediaMetadataRetriever.setDataSource(url, headers)` 远程读标题（无内嵌标题时取 URL 文件名）、时长、中间帧封面。**仅支持渐进式直链**（mp4 等）；HLS/DASH 清单不支持（探测即失败，UI 提示检查链接）。封面帧远程提取依赖服务器 Range 支持，失败则卡片无封面（可选项）。
-- **下载**：`HttpURLConnection` 流式拷到 `filesDir/videos/`（原样保存，不转码），进度按整百分比节流回调（Content-Length 未知时为不定进度）；失败删除半成品文件。下载完成后用本地文件重读时长（比远程值可靠），封面帧存 `filesDir/thumbnails/` 并写 `thumbnailPath`，入库 `sourceType=NETWORK_DOWNLOADED`，此后与本地视频完全同权（分段/录音/配音）。
-- **不引入新依赖**：用平台 `HttpURLConnection`，不加 OkHttp。
-- **Manifest**：`INTERNET` 权限；`android:usesCleartextTraffic="true"`——练习用 App 需兼容 http 直链，且模拟器测试用宿主机 HTTP 服务（`python -m http.server` + `http://10.0.2.2:8000/...`）必须放行明文流量。
+- **最终形态：B 站缓存导入（m4s 合并）**。B 站等站点的页面链接非直链，App 内不做站点解析；用户用 B 站客户端下载视频，得到 video.m4s + audio.m4s 两个 DASH 分离文件，在 App 内导入合并。
+- `M4sVideoImporter` 用 `MediaExtractor` + `MediaMuxer` 按显示时间交错重封装为单个标准 mp4（纯 remux 不转码、无画质损失）；B 站会在 ftyp box 前塞若干混淆字节，拷贝时扫描头部剥掉。文件用 `OpenMultipleDocuments`（SAF）选取，轨道按 MIME 识别不依赖文件名，支持仅视频单文件。入库为 `sourceType=LOCAL` 的普通本地视频，与其余功能同权。
+- **注意**：Android 11+ 第三方 App 无法读取其他 App 的 `Android/data`，m4s 文件需先经 PC（USB/adb）复制到 Download 等可访问目录再选取。
+- ~~URL 直链下载（元信息探测 + HttpURLConnection 下载）~~：曾实现并构建通过，2026-09-05 经用户确认**移除**——m4s 导入已覆盖实际需求（B 站为唯一网络来源，且客户端下载画质更高）。`NetworkVideoImporter`、URL 对话框、`INTERNET` 权限与 `usesCleartextTraffic` 均已删除；实现思路记录在 devlog/2026-09-05，如未来需要可照此重做。
+
+## 打磨（里程碑 8 实现决策）
+
+- **缩略图**：`ThumbnailGenerator` 用 `MediaMetadataRetriever.getFrameAtTime`（中间帧、OPTION_CLOSEST_SYNC，参数为微秒）取帧，等比缩到最长边 ≤640、JPEG 80 存 `filesDir/thumbnails/`；导入（本地 + m4s）时生成,生成失败不影响导入（留 null）。存量视频由 `HomeViewModel` 启动时后台补齐。主页不引 Coil，用 `produceState` + `BitmapFactory`（两遍解码 inSampleSize）自行加载。
+- **⚠ 更新 videos 行必须用 `@Update`，禁止 REPLACE insert**：Room 开外键时 SQLite 的 `INSERT OR REPLACE` 是先 DELETE 再 INSERT，会级联删光该视频的 segments/recording_chunks。
+- **删除级联**：删行前先收集文件路径（视频/缩略图/全部 chunk 音频），先删 DB 行（Room 级联删子表）再删文件；文件删失败只留孤儿，由清扫兜底。删除前有中文确认对话框。
+- **生命周期**：`PlayerScreen` 把 `LifecycleEventObserver` 注册在 **Activity** 的 lifecycle（不能用 `LocalLifecycleOwner` = NavBackStackEntry，否则按返回键也触发 ON_STOP、与 onCleared 竞态）；ON_STOP 且 `!activity.isChangingConfigurations`（旋转 / 进页面横屏锁定也会触发 ON_STOP，必须排除）时调 `onHostStopped()`：录音中则按手动停止语义保存入库，随后暂停主 Player（配音 Player 由 ticker 镜像跟随）。回前台不自动播放，位置保留。按返回键退出时录音仍是丢弃语义（onCleared）。
+- **孤儿录音清扫**：`HomeViewModel` 启动时（进程内仅一次）扫 `filesDir/recordings/`，删除不被任何 chunk 行引用且 `lastModified` 距今 >60s 的文件（年龄阈值防与 stopRecording 异步落库竞态）。
+- **本地导入文件名**：目标文件加时间戳前缀 `<ts>_<displayName>`，防同名二次导入覆盖旧视频源文件。
+- **横屏视频进页体验优化**（2026-09-08 用户反馈）：原实现 `init` 里 `prepare()` 后立即 `play()`，而横竖屏判定依赖播放器回调 `onVideoSizeChanged`（晚于开播），导致横屏视频先在竖屏播几帧、再锁横屏触发 Activity 重建。改为：进页前用 `MediaMetadataRetriever` 读文件元数据提前判定方向（`isLandscapeFile` 读 VIDEO_WIDTH/HEIGHT/ROTATION），方向已知后写入 `uiState.isLandscapeVideo/orientationKnown`；`init` 只 `prepare()` 不 `play()`，播放由屏幕在「方向已知 + (横屏视频需等当前已转到横屏 | 竖屏视频无等待)」时通过 `startPlaybackWhenOriented(currentOrientation)` 一次性触发。横屏视频因此在 Activity 转到横屏后才开播,不再有竖屏播出画面。`onHostStopped` 消耗守卫防回前台自动播放。
+- **播放界面视觉重做**（2026-09-08，参考 B 站播放器风格，纯视觉、不改功能）：顶/底栏改渐变遮罩(`Brush.verticalGradient`)；时间轴进度条改自绘 `Canvas`（`TimelineSlider`：细圆角轨 3dp + 粉色已播放段 `TimelineAccent #FB7299` + 圆形滑块 + 分段刻度），**不用** Material `Slider` 的自定义 track/thumb（M3 1.4.0 该重载为实验 API，本工程 `@OptIn` 在 AGP 9 内置 Kotlin 下未生效）；时间显示移至进度条上方左对齐，录制计时留在按钮行；音量/配音区改半透明圆角面板。色调常量集中在 `PlayerScreen.kt` 顶部（`TimelineAccent`/`ScrimTop`/`ScrimBottom`/`ControlIdle`），不影响全局主题。**系统栏内缩**：遮罩必须 edge-to-edge（不能在控件层根 `Box` 上加 `systemBarsPadding()`，否则底部露黑带）；顶栏用 `windowInsetsPadding(WindowInsets.statusBars)`；底栏**不能**直接套 `navigationBars` 内边距——那会把控件顶到 16:9 视频的黑边之上、控件下露出黑带，令控件「浮」在屏幕中部；改为 `WindowInsets.navigationBars.getBottom()` 取实际值、**封顶 16dp** 后再作为底部 padding，使控件贴近屏幕下沿（参考图样式）同时不被手势条压住。
+- **音量与「节拍」控件**（2026-09-08 用户要求）：视频声跟随**系统媒体音量**——主 `player.volume = 1f`，删除了 App 内的「原声」滑条（`originalVolume`/`setOriginalVolume` 一并移除）。原「配音」回放在界面改称**「节拍」**（内部字段仍名 `dubbing*`，功能不变）：主页标记文案「有节拍」；播放页控件为底栏按钮行的「节拍」按钮（分段、倍速之间），点开是含开关 + 音量滑条的面板。`dubbingVolume` 语义改为**相对视频音量的倍率**，范围 `0..2`（默认 1，>1 可放大偏小的节拍声），常量 `PlayerViewModel.MAX_DUBBING_VOLUME`、`PlayerScreen.MAX_BEAT_VOLUME`。
+- **统一蓝色系**（2026-09-08 用户要求）：`Color.kt`/`Theme.kt` 全局改为蓝系（`Blue80/Blue40` + `BlueGrey` + `Sky`），**关闭动态取色**（`dynamicColor` 会用壁纸色覆盖，已移除该参数）；播放页覆盖层的强调色统一为 `AccentBlue (#4A90E2)`（时间轴已播放段、循环/节拍/分段编辑激活态），原粉 `#FB7299` 不再使用。**例外**：录音指示保留红色 `#FF5252`（`PlayerScreen.RecordingAccent`，用户要求与蓝色激活态区分）；`colorScheme.error`（删除类语义色）与白/黑/遮罩色保留。
+- **应用图标与开屏**（2026-09-08 用户要求，素材 `icon.jpg` / `figure.jpg` 在工程根目录）：
+  - 图标：自适应图标（`mipmap-anydpi/ic_launcher.xml`），前景 `ic_launcher_foreground.png`（各密度，白色舞蹈小人抠图、缩放居中于安全区），背景色 `values/colors.xml` 的 `ic_launcher_background (#A4D1F0)`；另有各密度位图 `ic_launcher(_round).png` 兼容旧启动器。旧的模板矢量图标（`ic_launcher_background/foreground.xml`）与 webp 已删。
+  - 开屏：**不引第三方库**（未缓存 `androidx.core:core-splashscreen`，避免拉依赖风险），纯主题实现——`drawable/splash_background.xml`（米黄 `#FDF5D8` + 居中 `splash_logo`）设为 `android:windowBackground`；`values-v31/themes.xml` 复用 `windowSplashScreenBackground`/`windowSplashScreenAnimatedIcon`（Android 12+ 系统 SplashScreen）。logo 为 `figure.jpg` 裁出的猫，各密度 `drawable-*/splash_logo.png`。
 
 ## 权限
 
 - `RECORD_AUDIO`（录音）
 - `READ_MEDIA_VISUAL_USER_SELECTED` / `READ_EXTERNAL_STORAGE`（选本地视频，视系统文件选择器策略）
-- `INTERNET`（网络视频元信息与下载）
+- ~~`INTERNET`（网络视频元信息与下载）~~ 已随 URL 直链下载功能移除（2026-09-05）
 
 ## 待定 / 待验证项
 
@@ -79,6 +95,7 @@ RecordingChunk(id, videoId FK, audioPath, blockStartMs, blockEndMs, recordedMs, 
 
 - **横竖屏策略（覆盖 DESIGN 2.9 / 5.7）**：2026-09-03 用户要求——识别视频源方向，横屏视频自动将 Activity 锁为横屏播放（画面相对竖屏机身顺时针旋转 90°），UI 随之横屏布局；竖屏视频保持方向跟随设备。实现：`Player.Listener.onVideoSizeChanged`（用 `unappliedRotationDegrees` 修正宽高）→ `activity.requestedOrientation = SCREEN_ORIENTATION_LANDSCAPE / UNSPECIFIED`，退出播放页恢复 UNSPECIFIED。
 - **倍速控件形态（细化 DESIGN 2.3）**：右下角单按钮显示当前倍速（如「1.0×」），点击弹出菜单选择 0.5×–1.0×。
+- **视频来源扩展（覆盖 DESIGN 2.1 网络视频）**：2026-09-05 用户决定——不做 URL 元信息 + 直链下载（已实现后按用户要求移除），改为**导入 B 站客户端缓存的 m4s 文件对**（合并为普通本地视频），详见「网络视频」一节。
 
 ## 开发环境备忘（已踩坑记录）
 

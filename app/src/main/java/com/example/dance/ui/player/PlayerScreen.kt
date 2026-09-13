@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.ContextWrapper
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.view.WindowManager
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -27,11 +28,16 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.systemBarsPadding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBars
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -48,7 +54,6 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Slider
-import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -66,9 +71,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
@@ -78,11 +86,15 @@ import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import com.example.dance.R
+import com.example.dance.ui.theme.AccentBlue
 import com.example.dance.util.formatDurationMs
 import java.util.Locale
 import kotlin.math.roundToInt
@@ -94,8 +106,26 @@ private const val CONTROLS_HIDE_DELAY_MS = 3_000L
 /** A horizontal swipe across the full screen width seeks this many seconds. */
 private const val SWIPE_FULL_WIDTH_SECONDS = 60
 
-/** Indicator color for the recording state. */
-private val RecordingRed = Color(0xFFFF5252)
+/**
+ * Recording indicator color. Deliberately red, not the blue accent (2026-09-08
+ * user request): "recording" must stay visually distinct from the other active
+ * control states, which all use [Accent].
+ */
+private val RecordingAccent = Color(0xFFFF5252)
+
+/**
+ * Player-control palette (bilibili-style overlay, unified blue in 2026-09-08):
+ * a blue accent for the played portion of the timeline and active controls,
+ * plus translucent scrims that let the video show through. Kept local to this
+ * file so the rest of the app keeps its theme.
+ */
+private val Accent = AccentBlue
+private val ScrimTop = Color(0xB3000000)
+private val ScrimBottom = Color(0xCC000000)
+private val ControlIdle = Color(0xCCFFFFFF)
+
+/** Beat-volume multiplier range: 0 = muted, 1 = level with the video, 2 = boosted. */
+private const val MAX_BEAT_VOLUME = 2f
 
 private tailrec fun Context.findActivity(): Activity? = when (this) {
     is Activity -> this
@@ -105,6 +135,10 @@ private tailrec fun Context.findActivity(): Activity? = when (this) {
 
 /** e.g. 1.0×, 0.5× — always one decimal place. */
 private fun formatSpeed(speed: Float): String = String.format(Locale.US, "%.1f×", speed)
+
+/** Beat volume as a percentage of the video level, e.g. "100%", "150%". */
+private fun formatBeatVolume(volume: Float): String =
+    "${(volume * 100).roundToInt()}%"
 
 /**
  * Player page, Milestone 2 scope: main-player playback of a local video with
@@ -124,6 +158,7 @@ fun PlayerScreen(
     // Bumped on any control interaction to restart the auto-hide countdown.
     var interactionTick by remember { mutableIntStateOf(0) }
     var speedMenuExpanded by remember { mutableStateOf(false) }
+    var beatMenuExpanded by remember { mutableStateOf(false) }
     // Off by default: only the segment bar shows; on: split editing controls appear.
     var segmentEditMode by remember { mutableStateOf(false) }
     // Swipe-seek preview in seconds; non-null while a horizontal swipe is in progress.
@@ -159,6 +194,24 @@ fun PlayerScreen(
             activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
         }
     }
+    // App-to-background handling. Registered on the ACTIVITY lifecycle, not
+    // LocalLifecycleOwner (the NavBackStackEntry): back navigation also stops
+    // the entry, which would race the ON_STOP save against onCleared's scope
+    // cancellation and break the "back = discard recording" semantics.
+    DisposableEffect(Unit) {
+        val activity = view.context.findActivity()
+        val owner = activity as? LifecycleOwner
+            ?: return@DisposableEffect onDispose {}
+        val observer = LifecycleEventObserver { _, event ->
+            // Config changes (rotation, the landscape lock applied on entry)
+            // also fire ON_STOP on the old activity; skip those.
+            if (event == Lifecycle.Event.ON_STOP && !activity.isChangingConfigurations) {
+                viewModel.onHostStopped()
+            }
+        }
+        owner.lifecycle.addObserver(observer)
+        onDispose { owner.lifecycle.removeObserver(observer) }
+    }
     // Landscape source → lock the activity to landscape so the picture fills the
     // screen (content rotated 90° clockwise relative to a portrait-held device)
     // and the control overlay re-lays out for landscape automatically.
@@ -166,6 +219,15 @@ fun PlayerScreen(
         view.context.findActivity()?.requestedOrientation =
             if (state.isLandscapeVideo) ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
             else ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+    }
+    // Actually start the gated initial play: only once the orientation is known
+    // AND, for a landscape source, the activity is already in landscape. A
+    // landscape video therefore rotates before it plays (no portrait frames).
+    // Portrait sources play as soon as the orientation is known, whatever the
+    // current device orientation (FIT scaling letterboxes a sideways portrait).
+    val configOrientation = LocalConfiguration.current.orientation
+    LaunchedEffect(state.orientationKnown, state.isLandscapeVideo, configOrientation) {
+        viewModel.startPlaybackWhenOriented(configOrientation)
     }
     // System bars follow the control overlay (DESIGN 2.8).
     LaunchedEffect(controlsVisible) {
@@ -177,11 +239,11 @@ fun PlayerScreen(
             controller.hide(WindowInsetsCompat.Type.systemBars())
         }
     }
-    LaunchedEffect(controlsVisible, interactionTick, speedMenuExpanded, state.selectedSplitIndex, state.isRecording) {
-        // No auto-hide while the speed menu is open, a split point is being
+    LaunchedEffect(controlsVisible, interactionTick, speedMenuExpanded, beatMenuExpanded, state.selectedSplitIndex, state.isRecording) {
+        // No auto-hide while the speed/beat menu is open, a split point is being
         // edited, or a recording is in progress (the stop button must stay).
-        if (controlsVisible && !speedMenuExpanded && state.selectedSplitIndex == null &&
-            !state.isRecording
+        if (controlsVisible && !speedMenuExpanded && !beatMenuExpanded &&
+            state.selectedSplitIndex == null && !state.isRecording
         ) {
             delay(CONTROLS_HIDE_DELAY_MS)
             controlsVisible = false
@@ -274,6 +336,8 @@ fun PlayerScreen(
                 speedSteps = viewModel.speedSteps,
                 speedMenuExpanded = speedMenuExpanded,
                 onSpeedMenuExpandedChange = { speedMenuExpanded = it; interactionTick++ },
+                beatMenuExpanded = beatMenuExpanded,
+                onBeatMenuExpandedChange = { beatMenuExpanded = it; interactionTick++ },
                 onBack = onBack,
                 onPlayPause = { viewModel.togglePlayPause(); interactionTick++ },
                 onSeek = { viewModel.seekTo(it); interactionTick++ },
@@ -292,7 +356,6 @@ fun PlayerScreen(
                 onNudgeSplit = { viewModel.nudgeSelectedSplit(it); interactionTick++ },
                 onSegmentTapped = { viewModel.onSegmentTapped(it); interactionTick++ },
                 onToggleDubbing = { viewModel.toggleDubbing(); interactionTick++ },
-                onOriginalVolume = { viewModel.setOriginalVolume(it); interactionTick++ },
                 onDubbingVolume = { viewModel.setDubbingVolume(it); interactionTick++ },
                 onRecordClick = {
                     interactionTick++
@@ -315,6 +378,8 @@ private fun PlayerControls(
     speedSteps: List<Float>,
     speedMenuExpanded: Boolean,
     onSpeedMenuExpandedChange: (Boolean) -> Unit,
+    beatMenuExpanded: Boolean,
+    onBeatMenuExpandedChange: (Boolean) -> Unit,
     onBack: () -> Unit,
     onPlayPause: () -> Unit,
     onSeek: (Long) -> Unit,
@@ -329,15 +394,35 @@ private fun PlayerControls(
     onNudgeSplit: (Long) -> Unit,
     onSegmentTapped: (Int) -> Unit,
     onToggleDubbing: () -> Unit,
-    onOriginalVolume: (Float) -> Unit,
     onDubbingVolume: (Float) -> Unit,
     onRecordClick: () -> Unit
 ) {
-    Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .systemBarsPadding()
-    ) {
+    Box(modifier = Modifier.fillMaxSize()) {
+        // Gradient scrims span the full screen edge-to-edge (they are not inset
+        // by the system bars) so no black strip shows below the controls; the
+        // bars themselves apply the insets so buttons clear the system UI.
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(96.dp)
+                .align(Alignment.TopCenter)
+                .background(
+                    Brush.verticalGradient(
+                        colors = listOf(ScrimTop, Color.Transparent)
+                    )
+                )
+        )
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(220.dp)
+                .align(Alignment.BottomCenter)
+                .background(
+                    Brush.verticalGradient(
+                        colors = listOf(Color.Transparent, ScrimBottom)
+                    )
+                )
+        )
         // Top bar: back + title. The empty pointerInput makes the whole bar a
         // hit target so gestures below it (GestureLayer) never see its touches.
         Row(
@@ -345,8 +430,8 @@ private fun PlayerControls(
                 .fillMaxWidth()
                 .align(Alignment.TopStart)
                 .pointerInput(Unit) {}
-                .background(Color.Black.copy(alpha = 0.5f))
-                .padding(horizontal = 4.dp, vertical = 4.dp),
+                .windowInsetsPadding(WindowInsets.statusBars)
+                .padding(horizontal = 4.dp, vertical = 6.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             IconButton(onClick = onBack) {
@@ -366,14 +451,23 @@ private fun PlayerControls(
         }
 
         // Bottom control block: timeline + transport + speed. Blocks the
-        // gesture layer the same way as the top bar.
+        // gesture layer the same way as the top bar. Only a small inset is left
+        // for the gesture bar so the controls hug the screen edge like the
+        // reference layout instead of floating above a black strip.
+        val navBottomDp = with(LocalDensity.current) {
+            WindowInsets.navigationBars.getBottom(this).toDp()
+        }
         Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .align(Alignment.BottomStart)
                 .pointerInput(Unit) {}
-                .background(Color.Black.copy(alpha = 0.5f))
-                .padding(horizontal = 12.dp, vertical = 4.dp)
+                .padding(
+                    start = 12.dp,
+                    end = 12.dp,
+                    top = 2.dp,
+                    bottom = navBottomDp.coerceAtMost(16.dp) + 2.dp
+                )
         ) {
             if (segmentEditMode) {
                 SplitEditRows(
@@ -384,19 +478,22 @@ private fun PlayerControls(
                     onNudgeSplit = onNudgeSplit
                 )
             }
-            VolumeRow(
-                state = state,
-                onToggleDubbing = onToggleDubbing,
-                onOriginalVolume = onOriginalVolume,
-                onDubbingVolume = onDubbingVolume
-            )
+            Spacer(Modifier.height(6.dp))
             SegmentBar(
                 state = state,
                 onSegmentTapped = onSegmentTapped
             )
+            // Time above the bar, left-aligned (bilibili-style), then the thin
+            // timeline itself.
+            Text(
+                text = "${formatDurationMs(state.positionMs)} / ${formatDurationMs(state.durationMs)}",
+                color = ControlIdle,
+                style = MaterialTheme.typography.labelSmall
+            )
             TimelineSlider(
                 positionMs = state.positionMs,
                 durationMs = state.durationMs,
+                boundaries = state.boundaries,
                 enabled = !state.isRecording,
                 onSeek = onSeek,
                 onScrub = onScrub
@@ -421,8 +518,8 @@ private fun PlayerControls(
                         contentDescription = stringResource(R.string.player_loop),
                         tint = when {
                             state.isRecording -> Color.White.copy(alpha = 0.3f)
-                            state.loopEnabled -> MaterialTheme.colorScheme.primary
-                            else -> Color.White.copy(alpha = 0.5f)
+                            state.loopEnabled -> Accent
+                            else -> ControlIdle
                         }
                     )
                 }
@@ -435,19 +532,13 @@ private fun PlayerControls(
                             if (state.isRecording) R.string.player_record_stop
                             else R.string.player_record
                         ),
-                        tint = if (state.isRecording) RecordingRed else Color.White
+                        tint = if (state.isRecording) RecordingAccent else Color.White
                     )
                 }
                 if (state.isRecording) {
                     Text(
                         text = "● " + formatDurationMs(state.recordingElapsedMs),
-                        color = RecordingRed,
-                        style = MaterialTheme.typography.labelMedium
-                    )
-                } else {
-                    Text(
-                        text = "${formatDurationMs(state.positionMs)} / ${formatDurationMs(state.durationMs)}",
-                        color = Color.White,
+                        color = RecordingAccent,
                         style = MaterialTheme.typography.labelMedium
                     )
                 }
@@ -457,8 +548,7 @@ private fun PlayerControls(
                     onClick = onToggleSegmentEdit,
                     enabled = !state.isRecording,
                     colors = ButtonDefaults.textButtonColors(
-                        contentColor = if (segmentEditMode) MaterialTheme.colorScheme.primary
-                        else Color.White,
+                        contentColor = if (segmentEditMode) Accent else Color.White,
                         disabledContentColor = Color.White.copy(alpha = 0.3f)
                     ),
                     contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp)
@@ -467,6 +557,58 @@ private fun PlayerControls(
                         text = stringResource(R.string.player_segment_edit),
                         style = MaterialTheme.typography.labelLarge
                     )
+                }
+                // Beat control: toggles beat playback and sets the beat volume
+                // (a multiplier of the video sound, 0–2). The video itself
+                // follows the system media volume, so there is no separate
+                // original-sound slider (2026-09-08).
+                Box {
+                    TextButton(
+                        onClick = { onBeatMenuExpandedChange(true) },
+                        enabled = !state.isRecording,
+                        colors = ButtonDefaults.textButtonColors(
+                            contentColor = if (state.dubbingEnabled) Accent
+                            else Color.White,
+                            disabledContentColor = Color.White.copy(alpha = 0.3f)
+                        ),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp)
+                    ) {
+                        Text(
+                            text = stringResource(R.string.player_beat),
+                            style = MaterialTheme.typography.labelLarge
+                        )
+                    }
+                    DropdownMenu(
+                        expanded = beatMenuExpanded,
+                        onDismissRequest = { onBeatMenuExpandedChange(false) }
+                    ) {
+                        DropdownMenuItem(
+                            text = { Text(stringResource(R.string.player_beat_toggle)) },
+                            trailingIcon = {
+                                Switch(
+                                    checked = state.dubbingEnabled,
+                                    onCheckedChange = { onToggleDubbing() }
+                                )
+                            },
+                            onClick = { onToggleDubbing() }
+                        )
+                        Column(Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
+                            Text(
+                                text = "${stringResource(R.string.player_beat_hint)} · " +
+                                    formatBeatVolume(state.dubbingVolume),
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            Slider(
+                                value = state.dubbingVolume
+                                    .coerceIn(0f, MAX_BEAT_VOLUME),
+                                onValueChange = onDubbingVolume,
+                                enabled = state.dubbingEnabled,
+                                valueRange = 0f..MAX_BEAT_VOLUME,
+                                modifier = Modifier.width(180.dp)
+                            )
+                        }
+                    }
                 }
                 // Speed selector: single button at the bottom-right, expands a menu.
                 Box {
@@ -573,81 +715,16 @@ private fun GestureLayer(
 }
 
 /**
- * Dubbing playback controls (DESIGN 2.6): original-sound volume slider, the
- * dubbing on/off switch, and the dubbing volume slider. Disabled while
- * recording (the dubbing player is paused then anyway).
+ * Timeline bar in the reference style: a thin rounded track, an accent-pink
+ * played portion, a small round thumb, and faint tick marks at segment
+ * boundaries. Drawn by hand (Canvas + drag gestures) rather than with
+ * Material's Slider, whose custom track/thumb API is experimental here.
  */
-@Composable
-private fun VolumeRow(
-    state: PlayerUiState,
-    onToggleDubbing: () -> Unit,
-    onOriginalVolume: (Float) -> Unit,
-    onDubbingVolume: (Float) -> Unit
-) {
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Text(
-            text = stringResource(R.string.player_volume_original),
-            color = Color.White,
-            style = MaterialTheme.typography.labelMedium
-        )
-        VolumeSlider(
-            value = state.originalVolume,
-            enabled = !state.isRecording,
-            onValueChange = onOriginalVolume,
-            modifier = Modifier
-                .weight(1f)
-                .padding(horizontal = 8.dp)
-        )
-        Switch(
-            checked = state.dubbingEnabled,
-            onCheckedChange = { onToggleDubbing() },
-            enabled = !state.isRecording
-        )
-        Text(
-            text = stringResource(R.string.player_dubbing),
-            color = if (state.dubbingEnabled) Color.White else Color.White.copy(alpha = 0.5f),
-            style = MaterialTheme.typography.labelMedium,
-            modifier = Modifier.padding(start = 4.dp)
-        )
-        VolumeSlider(
-            value = state.dubbingVolume,
-            enabled = !state.isRecording && state.dubbingEnabled,
-            onValueChange = onDubbingVolume,
-            modifier = Modifier
-                .weight(1f)
-                .padding(horizontal = 8.dp)
-        )
-    }
-}
-
-@Composable
-private fun VolumeSlider(
-    value: Float,
-    enabled: Boolean,
-    onValueChange: (Float) -> Unit,
-    modifier: Modifier = Modifier
-) {
-    Slider(
-        value = value.coerceIn(0f, 1f),
-        onValueChange = onValueChange,
-        enabled = enabled,
-        valueRange = 0f..1f,
-        colors = SliderDefaults.colors(
-            thumbColor = Color.White,
-            activeTrackColor = Color.White.copy(alpha = 0.8f),
-            inactiveTrackColor = Color.White.copy(alpha = 0.3f)
-        ),
-        modifier = modifier
-    )
-}
-
 @Composable
 private fun TimelineSlider(
     positionMs: Long,
     durationMs: Long,
+    boundaries: List<Long>,
     enabled: Boolean,
     onSeek: (Long) -> Unit,
     onScrub: () -> Unit
@@ -655,25 +732,88 @@ private fun TimelineSlider(
     // While scrubbing, show the drag position instead of the live player position.
     var scrubPositionMs by remember { mutableStateOf<Long?>(null) }
     val shown = scrubPositionMs ?: positionMs
-    Slider(
-        value = shown.toFloat().coerceIn(0f, durationMs.coerceAtLeast(1L).toFloat()),
-        valueRange = 0f..durationMs.coerceAtLeast(1L).toFloat(),
-        enabled = enabled,
-        onValueChange = {
-            scrubPositionMs = it.toLong()
-            onScrub()
-        },
-        onValueChangeFinished = {
-            scrubPositionMs?.let(onSeek)
-            scrubPositionMs = null
-        },
-        colors = SliderDefaults.colors(
-            thumbColor = MaterialTheme.colorScheme.primary,
-            activeTrackColor = MaterialTheme.colorScheme.primary,
-            inactiveTrackColor = Color.White.copy(alpha = 0.3f)
-        ),
-        modifier = Modifier.fillMaxWidth()
-    )
+    val safeDuration = durationMs.coerceAtLeast(1L)
+
+    Canvas(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(28.dp)
+            .pointerInput(enabled, safeDuration) {
+                if (!enabled) return@pointerInput
+                detectHorizontalDragGestures(
+                    onDragStart = { offset ->
+                        scrubPositionMs = (offset.x / size.width * safeDuration)
+                            .toLong().coerceIn(0L, safeDuration)
+                        onScrub()
+                    },
+                    onDragEnd = {
+                        scrubPositionMs?.let(onSeek)
+                        scrubPositionMs = null
+                    },
+                    onDragCancel = {
+                        scrubPositionMs = null
+                    },
+                    onHorizontalDrag = { change, _ ->
+                        change.consume()
+                        scrubPositionMs = (change.position.x / size.width * safeDuration)
+                            .toLong().coerceIn(0L, safeDuration)
+                        onScrub()
+                    }
+                )
+            }
+            .pointerInput(enabled, safeDuration) {
+                if (!enabled) return@pointerInput
+                detectTapGestures { offset ->
+                    onSeek(
+                        (offset.x / size.width * safeDuration)
+                            .toLong().coerceIn(0L, safeDuration)
+                    )
+                }
+            }
+    ) {
+        val midY = size.height / 2f
+        val trackHeight = 3.dp.toPx()
+        val thumbRadius = 7.dp.toPx()
+        val progressX = (shown.toFloat() / safeDuration * size.width)
+            .coerceIn(0f, size.width)
+        val trackAlpha = if (enabled) 1f else 0.4f
+
+        // Unplayed track.
+        drawRoundRect(
+            color = Color.White.copy(alpha = 0.25f * trackAlpha),
+            topLeft = Offset(0f, midY - trackHeight / 2f),
+            size = Size(size.width, trackHeight),
+            cornerRadius = CornerRadius(trackHeight / 2f, trackHeight / 2f)
+        )
+        // Played portion in the accent color.
+        drawRoundRect(
+            color = Accent.copy(alpha = trackAlpha),
+            topLeft = Offset(0f, midY - trackHeight / 2f),
+            size = Size(progressX, trackHeight),
+            cornerRadius = CornerRadius(trackHeight / 2f, trackHeight / 2f)
+        )
+        // Segment-boundary ticks (interior splits only).
+        boundaries.drop(1).dropLast(1).forEach { splitMs ->
+            val x = (splitMs.toFloat() / safeDuration * size.width).coerceIn(0f, size.width)
+            drawRoundRect(
+                color = Color.White.copy(alpha = 0.5f * trackAlpha),
+                topLeft = Offset(x - 0.5.dp.toPx(), midY - 5.dp.toPx()),
+                size = Size(1.dp.toPx(), 10.dp.toPx()),
+                cornerRadius = CornerRadius(0.5f, 0.5f)
+            )
+        }
+        // Thumb: a small white circle with a faint halo, like the reference.
+        drawCircle(
+            color = Color.Black.copy(alpha = 0.25f * trackAlpha),
+            radius = thumbRadius + 1.5.dp.toPx(),
+            center = Offset(progressX, midY)
+        )
+        drawCircle(
+            color = Color.White.copy(alpha = trackAlpha),
+            radius = thumbRadius,
+            center = Offset(progressX, midY)
+        )
+    }
 }
 
 /**
@@ -765,7 +905,7 @@ private fun SegmentBar(
     val durationMs = state.durationMs.coerceAtLeast(1L)
     val blockStart = state.blockStartIndex
     val blockEnd = state.blockEndIndex
-    val blockColor = MaterialTheme.colorScheme.primary
+    val blockColor = Accent
     Canvas(
         modifier = Modifier
             .fillMaxWidth()
@@ -787,10 +927,10 @@ private fun SegmentBar(
             if (x1 <= x0) return@forEachIndexed
             val inBlock = blockStart != null && blockEnd != null && index in blockStart..blockEnd
             drawRoundRect(
-                color = if (inBlock) blockColor else Color.White.copy(alpha = 0.35f),
+                color = if (inBlock) blockColor else Color.White.copy(alpha = 0.25f),
                 topLeft = Offset(x0, 0f),
                 size = Size(x1 - x0, size.height),
-                cornerRadius = CornerRadius(3f, 3f)
+                cornerRadius = CornerRadius(1.5f, 1.5f)
             )
         }
     }
